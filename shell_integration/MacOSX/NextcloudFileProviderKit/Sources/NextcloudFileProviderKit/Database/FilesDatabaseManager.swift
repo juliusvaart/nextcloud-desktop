@@ -323,6 +323,45 @@ public final class FilesDatabaseManager: Sendable {
     }
 
     ///
+    /// The containers to re-read for a set of numeric WebDAV file IDs received from notify-push.
+    ///
+    /// A push names what changed; this turns that into where to look. A changed directory is
+    /// returned as itself, a changed file as its parent — in both cases a depth-1 read of the
+    /// returned container shows the new state, including a child that was created or removed.
+    ///
+    /// Ids the database does not know are skipped rather than guessed at. That loses nothing in
+    /// practice: the server propagates a change's etag up every ancestor, so a push for a brand-new
+    /// item also carries its parent's id, and the parent is a container we already track. Unknown
+    /// ids on their own mean the change was outside the enumerated tree.
+    ///
+    public func containersForPushedFileIds(_ fileIds: Set<String>) -> Set<NSFileProviderItemIdentifier> {
+        guard !fileIds.isEmpty else {
+            return []
+        }
+
+        let changed = read("Could not look up item metadata by file identifiers.") { db in
+            try Array(fileIds).chunked(into: Self.inClauseChunkSize).flatMap { chunk in
+                try ItemMetadataRecord
+                    .filter(chunk.contains(ItemMetadataRecord.Columns.fileId) && ItemMetadataRecord.Columns.deleted == false)
+                    .fetchRecords(db, logger: logger)
+                    .map(\.metadata)
+            }
+        } ?? []
+
+        var containers = Set<NSFileProviderItemIdentifier>()
+
+        for metadata in changed {
+            if metadata.directory {
+                containers.insert(NSFileProviderItemIdentifier(metadata.ocId))
+            } else if let parent = parentItemIdentifierFromMetadata(metadata) {
+                containers.insert(parent)
+            }
+        }
+
+        return containers
+    }
+
+    ///
     /// Look up the item metadata by its account identifier and remote address.
     ///
     /// - Parameters:

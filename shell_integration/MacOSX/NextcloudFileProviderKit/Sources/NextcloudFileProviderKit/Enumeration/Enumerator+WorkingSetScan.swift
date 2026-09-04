@@ -369,6 +369,18 @@ extension Enumerator {
                                 // rather than walked now (which on a sparse domain would recurse into
                                 // entire never-visited subtrees). Its own change is still reported above
                                 // via `accumulatedUpdates` / `accumulatedCreations`.
+                                //
+                                // A pinned child is the exception. "Always keep downloaded" is an
+                                // explicit request for the whole subtree to be present, so deferring
+                                // to navigation contradicts it — and a directory created remotely
+                                // inside a pinned folder never has a materialised descendant at the
+                                // moment it is discovered, so the test above can never pass for it.
+                                // The folder was reported and appeared locally while its contents
+                                // stayed invisible until the user opened it. The pin is read from the
+                                // persisted row rather than `childDirectory`, whose `keepDownloaded`
+                                // is the pre-ingestion value: `depth1ReadUpdateItemMetadatas` is what
+                                // applies the parent's pin to a new row, and it does so on its own
+                                // copy.
                                 if changedChildOcIds.contains(childDirectory.ocId) {
                                     let childPath = childDirectory.remotePath()
                                     let childHasMaterialisedDescendant = materialisedItems.contains {
@@ -376,7 +388,11 @@ extension Enumerator {
                                             && ($0.hasSameRemotePath(as: childPath)
                                                 || $0.isDescendant(of: childPath))
                                     }
-                                    if childHasMaterialisedDescendant,
+                                    let childIsPinned = dbManager
+                                        .itemMetadata(ocId: childDirectory.ocId)?
+                                        .keepDownloaded == true
+
+                                    if childHasMaterialisedDescendant || childIsPinned,
                                        enqueuedDirectoryIds.insert(childDirectory.ocId).inserted
                                     {
                                         scanQueue.append(childDirectory)

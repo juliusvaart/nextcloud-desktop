@@ -314,7 +314,49 @@ extension Enumerator {
             }
         }
 
-        while !scanQueue.isEmpty {
+        // Containers a push named after this walk had already passed them.
+        //
+        // A full walk takes as long as the materialised set is large — 143 seconds when measured —
+        // and every push arriving during one used to wait for it to end plus the framework's next
+        // call back in: eight pushes spread over 48 seconds were all answered 133 seconds after the
+        // first. When the change lands in a folder this walk has already read, the walk will never
+        // see it, so the wait is not even doing anything. Re-admitting those folders costs one read
+        // each and answers them in the next depth wave instead.
+        //
+        // Only folders already marked scanned are admitted; one still queued will be read anyway,
+        // and appending it twice would read it twice. Each is admitted at most once, so a folder
+        // pushed repeatedly cannot keep the walk alive.
+        var readmittedOcIds = Set<String>()
+
+        func readmitPushedContainers() {
+            let pending = RemoteChangeTargets.shared.peekTargets()
+
+            guard !pending.isEmpty else { return }
+
+            let candidates = pending.map(\.rawValue).filter {
+                scannedItemIds.contains($0) && !readmittedOcIds.contains($0)
+            }
+
+            guard !candidates.isEmpty else { return }
+
+            let readmitted = candidates.compactMap { materialisedByOcId[$0] }
+
+            guard !readmitted.isEmpty else { return }
+
+            readmittedOcIds.formUnion(readmitted.map(\.ocId))
+
+            for item in readmitted {
+                scannedItemIds.remove(item.ocId)
+            }
+
+            scanQueue.append(contentsOf: readmitted)
+            logger.info("Re-admitted \(readmitted.count) push-targeted container(s) into the running scan.")
+        }
+
+        while true {
+            readmitPushedContainers()
+
+            guard !scanQueue.isEmpty else { break }
             guard let waveDepth = scanQueue.map(remotePathDepth).min() else { break }
 
             let wave = scanQueue.filter { remotePathDepth($0) == waveDepth }

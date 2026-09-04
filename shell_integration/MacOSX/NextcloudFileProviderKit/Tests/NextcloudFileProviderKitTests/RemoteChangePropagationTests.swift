@@ -96,11 +96,13 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
         _ item: MockRemoteItem,
         downloaded: Bool = false,
         visitedDirectory: Bool = false,
+        keepDownloaded: Bool = false,
         syncTime: Date? = nil
     ) -> SendableItemMetadata {
         var metadata = item.toItemMetadata(account: Self.account)
         metadata.downloaded = downloaded
         metadata.visitedDirectory = visitedDirectory
+        metadata.keepDownloaded = keepDownloaded
         metadata.syncTime = syncTime ?? oldSyncTime
         Self.dbManager.addItemMetadata(metadata)
         return metadata
@@ -466,6 +468,47 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
         XCTAssertEqual(
             Self.dbManager.itemMetadata(ocId: folder.identifier)?.fileName, "renamedFolder",
             "The stale 404 must not rewrite the row back to its pre-rename name."
+        )
+    }
+
+    /// A folder created on the server inside a folder the user pinned ("Always keep downloaded"),
+    /// with a file already in it. The new folder has no materialised descendant at the moment it is
+    /// discovered — nothing inside it is even known yet — so the storm guard above would defer it to
+    /// navigation, which is what left the folder visible locally but permanently empty until the user
+    /// opened it. A pin is an explicit request for the whole subtree, so the scan must descend.
+    func testNewFolderUnderAPinnedFolderIsCrawled() async throws {
+        let db = Self.dbManager.ncDatabase(); debugPrint(db)
+
+        let pinnedFolder = makeFolder(name: "pinnedFolder", parent: rootItem, etag: "pinned-v1")
+
+        // Brand new on the server: no DB rows, and no materialised descendants to justify descent.
+        let newFolder = makeFolder(name: "NewFolder", parent: pinnedFolder, etag: "newfolder-v1")
+        let newLeaf = makeFile(name: "newLeaf", parent: newFolder, etag: "newleaf-v1")
+
+        seed(pinnedFolder, visitedDirectory: true, keepDownloaded: true)
+        // newFolder / newLeaf intentionally NOT seeded -> NEW on the next read, and `newFolder`
+        // inherits the pin when its row is written.
+
+        pinnedFolder.versionIdentifier = "pinned-v2"
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+
+        let recorder = EnumeratePathRecorder()
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            recorder.add(remotePath)
+        }
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+        let enumeratedPaths = recorder.paths
+
+        XCTAssertNil(observer.error)
+        XCTAssertTrue(
+            enumeratedPaths.contains { $0.hasSuffix("/NewFolder") },
+            "A new directory inside a pinned folder should be read, not deferred to navigation."
+        )
+        XCTAssertTrue(
+            reportedIds(observer).contains(newLeaf.identifier),
+            "A file created on the server inside a new folder under a pinned folder should surface."
         )
     }
 

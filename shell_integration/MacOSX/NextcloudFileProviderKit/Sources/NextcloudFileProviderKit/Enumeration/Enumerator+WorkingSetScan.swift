@@ -242,6 +242,56 @@ extension Enumerator {
         }
         var enqueuedDirectoryIds = Set(scanQueue.filter(\.directory).map(\.ocId))
 
+        // Indexes over the materialised set, built once.
+        //
+        // The merge below asks two questions of every child directory a read returns: "is this one
+        // materialised?" and "does anything materialised live underneath it?". Both used to be a
+        // linear pass over `materialisedItems`, which is the whole materialised set — 4041 rows on
+        // the account this was measured against. Across 7258 returned children that is tens of
+        // millions of canonicalised string comparisons, and it all runs single-threaded between
+        // depth waves with no request outstanding: a measured 143-second walk spent 89.6 s (62.5 %)
+        // with zero PROPFINDs in flight, in ten gaps averaging 8.6 s. The reads themselves are not
+        // the problem — 263.3 s of request time over six slots is 44 s of wall — nor are the
+        // database writes, at 23.4 s in total.
+        //
+        // `isDescendant(of:)` is a canonical prefix test against `path + "/"`, so the set of paths
+        // that have a materialised descendant is exactly the set of proper path prefixes of every
+        // materialised item. Precomputing it turns the second question into one hash lookup.
+        var materialisedByOcId = [String: SendableItemMetadata](minimumCapacity: materialisedItems.count)
+        var materialisedOcIdsByPath = [String: Set<String>]()
+        var pathsWithMaterialisedDescendant = Set<String>()
+
+        for item in materialisedItems {
+            materialisedByOcId[item.ocId] = item
+
+            let canonicalPath = item.remotePath().precomposedStringWithCanonicalMapping
+            materialisedOcIdsByPath[canonicalPath, default: []].insert(item.ocId)
+
+            // Every proper prefix of this path is an ancestor of a materialised item.
+            var ancestor = canonicalPath
+            while let separator = ancestor.lastIndex(of: "/") {
+                ancestor = String(ancestor[ancestor.startIndex ..< separator])
+
+                guard !ancestor.isEmpty, pathsWithMaterialisedDescendant.insert(ancestor).inserted else {
+                    // Already recorded, so every shallower ancestor is too.
+                    break
+                }
+            }
+        }
+
+        /// Whether anything materialised other than `ocId` itself sits at `path` or below it.
+        func hasMaterialisedContent(at path: String, excluding ocId: String) -> Bool {
+            let canonicalPath = path.precomposedStringWithCanonicalMapping
+
+            if pathsWithMaterialisedDescendant.contains(canonicalPath) {
+                return true
+            }
+
+            guard let atSamePath = materialisedOcIdsByPath[canonicalPath] else { return false }
+
+            return atSamePath.contains { $0 != ocId }
+        }
+
         /// The reads are issued concurrently, in waves grouped by remote-path depth.
         ///
         /// Depth is what makes concurrency safe here. The only ordering this loop depends on is that
@@ -383,11 +433,9 @@ extension Enumerator {
                                 // copy.
                                 if changedChildOcIds.contains(childDirectory.ocId) {
                                     let childPath = childDirectory.remotePath()
-                                    let childHasMaterialisedDescendant = materialisedItems.contains {
-                                        $0.ocId != childDirectory.ocId
-                                            && ($0.hasSameRemotePath(as: childPath)
-                                                || $0.isDescendant(of: childPath))
-                                    }
+                                    let childHasMaterialisedDescendant = hasMaterialisedContent(
+                                        at: childPath, excluding: childDirectory.ocId
+                                    )
                                     let childIsPinned = dbManager
                                         .itemMetadata(ocId: childDirectory.ocId)?
                                         .keepDownloaded == true
@@ -402,16 +450,15 @@ extension Enumerator {
 
                                 // Only skip unchanged child directories with no materialised descendants.
                                 // Lock changes don't propagate etags, so dirs with visible children must be enumerated.
-                                guard let localItem = materialisedItems.first(
-                                    where: { $0.ocId == childDirectory.ocId }
-                                ), localItem.isInSameDatabaseStoreableRemoteState(childDirectory) else {
+                                guard let localItem = materialisedByOcId[childDirectory.ocId],
+                                      localItem.isInSameDatabaseStoreableRemoteState(childDirectory)
+                                else {
                                     continue
                                 }
 
-                                let hasMaterialisedDescendants = materialisedItems.contains {
-                                    $0.ocId != localItem.ocId
-                                        && $0.isDescendant(of: localItem.remotePath())
-                                }
+                                let hasMaterialisedDescendants = pathsWithMaterialisedDescendant.contains(
+                                    localItem.remotePath().precomposedStringWithCanonicalMapping
+                                )
 
                                 if !hasMaterialisedDescendants {
                                     childrenCoveredByThisRead.insert(childDirectory.ocId)

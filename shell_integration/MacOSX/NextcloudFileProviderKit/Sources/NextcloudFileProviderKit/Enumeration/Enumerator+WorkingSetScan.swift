@@ -296,6 +296,28 @@ extension Enumerator {
                 let changes = readResult.changes ?? ChangeSet()
 
                 if readResult.error?.errorCode == 404 {
+                    // Believe the 404 only while the item still lives at the path that produced it.
+                    // The scan reads from a snapshot taken before any request went out, so a rename
+                    // or move committed while this PROPFIND was in flight turns the 404 into a fact
+                    // about a path nothing occupies any more, not about the item. Acting on it
+                    // reported a folder as deleted seconds after the user renamed it, and the
+                    // framework removed it from disk while it sat happily on the server.
+                    //
+                    // `survivingOcIds` does not cover this. It only spares items that reappeared in
+                    // `accumulatedUpdates` / `accumulatedCreations`, and the mover has already
+                    // written the correct row — so the new parent's depth-1 read finds the item
+                    // unchanged and never reports it. The database is the only witness left.
+                    let currentRemotePath = dbManager.itemMetadata(ocId: itemToScan.ocId)?.remotePath()
+
+                    if let currentRemotePath, currentRemotePath != itemRemoteUrl {
+                        logger.debug(
+                            "Ignoring 404 for a path the item has since moved away from.",
+                            [.item: itemToScan.ocId, .url: itemRemoteUrl]
+                        )
+                        scannedItemIds.insert(itemToScan.ocId)
+                        continue
+                    }
+
                     accumulatedDeletions.append(itemToScan)
                     scannedItemIds.insert(itemToScan.ocId)
                     // Children are not marked deleted here — they may have moved with their parent.

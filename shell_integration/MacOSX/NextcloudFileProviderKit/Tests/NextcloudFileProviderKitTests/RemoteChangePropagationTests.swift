@@ -421,6 +421,54 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
         )
     }
 
+    /// A rename that lands while the scan's PROPFIND for the old path is still in flight. The scan
+    /// reads from a snapshot taken before any request went out, so the 404 describes a path nothing
+    /// occupies any more rather than a deleted item. Treating it as a deletion took a folder the user
+    /// had just created and renamed off disk while it sat on the server, and rewrote its database row
+    /// back to the pre-rename name with `deleted` set.
+    ///
+    /// `survivingOcIds` cannot catch this: the mover has already written the correct row, so the new
+    /// parent's depth-1 read finds the item unchanged and never adds it to `accumulatedUpdates`.
+    func testA404ForAPathTheItemHasMovedAwayFromIsNotADeletion() async throws {
+        let db = Self.dbManager.ncDatabase(); debugPrint(db)
+
+        let folder = makeFolder(name: "folder", parent: rootItem, etag: "folder-v1")
+        let seeded = seed(folder, visitedDirectory: true)
+
+        // The server has already accepted the rename, so the path the scan holds 404s.
+        rootItem.children.removeAll { $0 === folder }
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+
+        // Commit the rename to the database while that PROPFIND is in flight — the window the
+        // scan's snapshot cannot see.
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            guard remotePath.hasSuffix("/folder") else { return }
+
+            var renamed = seeded
+            renamed.fileName = "renamedFolder"
+            renamed.fileNameView = "renamedFolder"
+            Self.dbManager.addItemMetadata(renamed)
+        }
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+        let deletedIds = Set(observer.deletedItemIdentifiers.map(\.rawValue))
+
+        XCTAssertNil(observer.error)
+        XCTAssertFalse(
+            deletedIds.contains(folder.identifier),
+            "A 404 for a path the item has since been renamed away from must not be reported as a deletion."
+        )
+        XCTAssertEqual(
+            Self.dbManager.itemMetadata(ocId: folder.identifier)?.deleted, false,
+            "The stale 404 must not mark the moved item's row deleted."
+        )
+        XCTAssertEqual(
+            Self.dbManager.itemMetadata(ocId: folder.identifier)?.fileName, "renamedFolder",
+            "The stale 404 must not rewrite the row back to its pre-rename name."
+        )
+    }
+
     /// S4: the change-detection predicate `isInSameDatabaseStoreableRemoteState` keys on ETag (+ a
     /// fixed field set). If a file's content changes but its ETag is unchanged, the predicate treats
     /// it as unchanged and the update is skipped. Real servers bump the ETag on content change, so

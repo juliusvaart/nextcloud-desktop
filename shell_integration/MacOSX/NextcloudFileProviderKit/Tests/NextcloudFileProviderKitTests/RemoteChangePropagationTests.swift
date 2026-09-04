@@ -423,6 +423,42 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
         )
     }
 
+    /// A push naming a container the walk has already read. The walk will never revisit it on its
+    /// own, so without re-admission the change waits for the whole walk to end and for the framework
+    /// to call back again — measured at 133 seconds for a push that arrived 48 seconds into a
+    /// 143-second walk. The targets stay pending so the next derivation still consumes them.
+    func testAContainerPushedMidScanIsReReadBeforeTheWalkEnds() async throws {
+        let db = Self.dbManager.ncDatabase(); debugPrint(db)
+
+        let folder = makeFolder(name: "folder", parent: rootItem, etag: "folder-v1")
+        seed(folder, visitedDirectory: true)
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+
+        let recorder = EnumeratePathRecorder()
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            recorder.add(remotePath)
+
+            guard remotePath.hasSuffix("/folder") else { return }
+
+            // A push lands naming the folder this read is already covering.
+            RemoteChangeTargets.shared.record(containers: [NSFileProviderItemIdentifier(folder.identifier)])
+        }
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+        let reads = recorder.paths.filter { $0.hasSuffix("/folder") }.count
+
+        XCTAssertNil(observer.error)
+        XCTAssertGreaterThanOrEqual(
+            reads, 2,
+            "A container a push names while the walk is running must be re-read before the walk ends."
+        )
+        XCTAssertFalse(
+            RemoteChangeTargets.shared.peekTargets().isEmpty,
+            "Re-admission must leave the targets pending so the next derivation still consumes them."
+        )
+    }
+
     /// A rename that lands while the scan's PROPFIND for the old path is still in flight. The scan
     /// reads from a snapshot taken before any request went out, so the 404 describes a path nothing
     /// occupies any more rather than a deleted item. Treating it as a deletion took a folder the user

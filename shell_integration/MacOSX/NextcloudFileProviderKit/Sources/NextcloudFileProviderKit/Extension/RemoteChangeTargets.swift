@@ -70,6 +70,22 @@ final class RemoteChangeTargets: @unchecked Sendable {
     }
 
     ///
+    /// The containers accumulated so far, without clearing them.
+    ///
+    /// A scan already in flight uses this to pick up containers a push named after it started, so a
+    /// change does not have to wait for the walk to end. The targets stay pending deliberately: the
+    /// derivation that consumes them decides between a targeted and a full walk on whether anything
+    /// is pending, so clearing them here would make the next pass a needless full reconciliation.
+    /// The cost is that the next targeted pass re-reads a container this one already covered, which
+    /// is one PROPFIND.
+    ///
+    func peekTargets() -> Set<NSFileProviderItemIdentifier> {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending
+    }
+
+    ///
     /// Whether this derivation must be a full walk rather than a targeted one.
     ///
     /// True until the first full scan has run, and again once ``fullScanInterval`` has elapsed since

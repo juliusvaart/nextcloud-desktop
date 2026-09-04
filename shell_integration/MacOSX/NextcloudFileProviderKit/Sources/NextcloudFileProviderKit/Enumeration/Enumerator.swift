@@ -5,6 +5,62 @@
 import NextcloudKit
 
 ///
+/// What the framework actually asked one enumerator for, between construction and invalidation.
+///
+/// The extension logs when it hands an enumerator over and when the framework throws it away, but
+/// nothing in between unless a request arrives — so an enumerator the framework creates and then
+/// never drives leaves a gap in the log that looks identical to one that was never created at all.
+/// That gap hid a reproducible symptom: browsing into a folder for the first time shows a spinner
+/// that never resolves, and the contents appear only after navigating away and back. In one capture
+/// the framework built an enumerator for the folder and discarded it 4m09s later having asked it for
+/// nothing, while the extension sat idle and kept answering thumbnail requests. Session-wide that
+/// run recorded 40 enumerators built and one `enumerateItems` call.
+///
+/// Counting the requests turns "we cannot see what the framework did" into a line stating exactly
+/// which entry points it used. Guarded by an `NSLock` because ``Enumerator`` is `Sendable` and the
+/// framework calls these from its own threads.
+///
+private final class EnumeratorActivity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var itemRequests = 0
+    private var changeRequests = 0
+    private var anchorRequests = 0
+
+    let createdAt = Date()
+
+    func recordItemRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        itemRequests += 1
+    }
+
+    func recordChangeRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        changeRequests += 1
+    }
+
+    func recordAnchorRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        anchorRequests += 1
+    }
+
+    /// A one-line summary for the invalidation log, plus whether the framework ever asked for
+    /// content — the distinction that matters when a folder will not load.
+    func summary() -> (description: String, wasDrivenForContent: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let lifetime = String(format: "%.1f", Date().timeIntervalSince(createdAt))
+        let description =
+            "lifetime \(lifetime)s, item requests: \(itemRequests), change requests: \(changeRequests), anchor requests: \(anchorRequests)"
+
+        return (description, itemRequests > 0 || changeRequests > 0)
+    }
+}
+
+///
 /// The `NSFileProviderEnumerator` implementation that enumerates file-provider items and derives
 /// remote change sets for one container.
 ///
@@ -32,6 +88,9 @@ import NextcloudKit
 /// `SyncAnchor` extension; turning metadata into observer callbacks lives in `ObserverReporting`.
 ///
 public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
+    /// See ``EnumeratorActivity``.
+    private let activity = EnumeratorActivity()
+
     let enumeratedItemIdentifier: NSFileProviderItemIdentifier
     /// Internal (not private) so the concern-specific extensions in sibling files can read it.
     let enumeratedItemMetadata: SendableItemMetadata?
@@ -109,7 +168,22 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
     }
 
     public func invalidate() {
-        logger.debug("Enumerator is being invalidated.", [.item: enumeratedItemIdentifier, .name: enumeratedItemMetadata?.fileName])
+        let (activitySummary, wasDrivenForContent) = activity.summary()
+
+        // An enumerator discarded without ever being asked for items or changes is the signature of
+        // a first-browse spinner that never resolves. Report it at `info` so it survives a log with
+        // debug turned off, and keep the ordinary case at `debug`.
+        if wasDrivenForContent {
+            logger.debug(
+                "Enumerator is being invalidated (\(activitySummary)).",
+                [.item: enumeratedItemIdentifier, .name: enumeratedItemMetadata?.fileName]
+            )
+        } else {
+            logger.info(
+                "Enumerator is being invalidated without ever having been asked for items or changes (\(activitySummary)).",
+                [.item: enumeratedItemIdentifier, .name: enumeratedItemMetadata?.fileName]
+            )
+        }
     }
 
     ///
@@ -128,6 +202,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
     // MARK: - Protocol methods
 
     public func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
+        activity.recordItemRequest()
         logger.info("Received enumerate items request for enumerator with user", [.account: account.ncKitAccount, .url: serverUrl])
 
         if enumeratedItemIdentifier == .trashContainer {
@@ -140,6 +215,7 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
     }
 
     public func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
+        activity.recordChangeRequest()
         logger.debug("Enumerating changes (anchor: \(String(data: anchor.rawValue, encoding: .utf8) ?? "")).", [.url: serverUrl])
 
         let anchorKey = String(data: anchor.rawValue, encoding: .utf8) ?? ""
@@ -176,6 +252,14 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
     }
 
     public func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
+        // The only framework call that used to leave no trace. It sits between handing an enumerator
+        // over and being asked for anything, so without it there is no way to tell "the framework
+        // never came back" from "the framework never got this far".
+        activity.recordAnchorRequest()
+        logger.debug(
+            "Reporting current sync anchor.",
+            [.item: enumeratedItemIdentifier, .name: enumeratedItemMetadata?.fileName]
+        )
         completionHandler(currentAnchor)
     }
 }

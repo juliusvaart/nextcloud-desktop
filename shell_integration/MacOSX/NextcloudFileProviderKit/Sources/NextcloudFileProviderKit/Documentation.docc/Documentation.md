@@ -55,3 +55,4 @@ It is designed specifically for the implementation of this file provider extensi
 - <doc:ChunkedUploads>
 - <doc:UnicodePathNormalization>
 - <doc:PerformanceBenchmarks>
+- <doc:PerformanceBenchmarkTests>

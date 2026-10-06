@@ -53,7 +53,9 @@ extension FileProviderExtension: ClientCommunicationProtocol {
         }
 
         guard fileIds.isEmpty == false else {
-            logger.info("Received file change notification without file IDs. Signalling enumerator.")
+            logger.info("Received file change notification without file IDs. Requesting a full scan.")
+            // Without ids nothing can be targeted, and the main app sends this whenever the push connection is (re-)established, after which anything changed while it was down must be found.
+            RemoteChangeTargets.shared.requestFullScan()
             notifyChange()
             completionHandler(true)
             return

@@ -990,12 +990,117 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
 
         XCTAssertTrue(targets.shouldRunFullScan(), "Before any full scan has run, one is due.")
 
-        let completedAt = Date()
-        targets.noteFullScanCompleted(at: completedAt)
-        XCTAssertFalse(targets.shouldRunFullScan(now: completedAt.addingTimeInterval(60)))
+        let startedAt = Date()
+        targets.noteFullScanCompleted(startedAt: startedAt)
+        XCTAssertFalse(targets.shouldRunFullScan(now: startedAt.addingTimeInterval(60)))
         XCTAssertTrue(
-            targets.shouldRunFullScan(now: completedAt.addingTimeInterval(RemoteChangeTargets.fullScanInterval + 1)),
+            targets.shouldRunFullScan(now: startedAt.addingTimeInterval(RemoteChangeTargets.fullScanInterval + 1)),
             "Once the interval has elapsed a full reconciliation is due again."
+        )
+    }
+
+    /// Pushes are lost while the connection is down, so its re-establishment must force a full walk
+    /// even when the interval is far from elapsed and other pushes have targeted containers.
+    func testARequestedFullScanIsDueUntilAWalkStartedAfterItCompletes() {
+        let targets = RemoteChangeTargets.shared
+        let lastWalk = Date()
+        targets.noteFullScanCompleted(startedAt: lastWalk)
+        targets.record(containers: [NSFileProviderItemIdentifier("pushed")])
+
+        let requestedAt = lastWalk.addingTimeInterval(120)
+        targets.requestFullScan(at: requestedAt)
+        XCTAssertTrue(targets.shouldRunFullScan(now: requestedAt.addingTimeInterval(1)), "A requested full scan is due at once.")
+
+        targets.noteFullScanCompleted(startedAt: requestedAt.addingTimeInterval(5))
+        XCTAssertFalse(
+            targets.shouldRunFullScan(now: requestedAt.addingTimeInterval(60)),
+            "A walk that started after the request settles it."
+        )
+    }
+
+    /// A walk already under way when the request arrives may have read the changed folders before
+    /// they changed, so it must not settle the request.
+    func testAWalkThatStartedBeforeTheRequestDoesNotSettleIt() {
+        let targets = RemoteChangeTargets.shared
+        let walkStartedAt = Date()
+        targets.requestFullScan(at: walkStartedAt.addingTimeInterval(10))
+        targets.noteFullScanCompleted(startedAt: walkStartedAt)
+
+        XCTAssertTrue(
+            targets.shouldRunFullScan(now: walkStartedAt.addingTimeInterval(60)),
+            "The request must survive a walk that started before it."
+        )
+    }
+
+    /// End to end: with a push's target pending and the interval not elapsed, a requested full scan
+    /// still reads every materialised container rather than only the targeted one.
+    func testARequestedFullScanOverridesPendingTargets() async throws {
+        let targeted = makeFolder(name: "targeted", parent: rootItem, etag: "targeted-v1")
+        let untouched = makeFolder(name: "untouched", parent: rootItem, etag: "untouched-v1")
+        seed(targeted, visitedDirectory: true)
+        seed(untouched, visitedDirectory: true)
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let recorder = EnumeratePathRecorder()
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            recorder.add(remotePath)
+        }
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+        RemoteChangeTargets.shared.record(containers: [NSFileProviderItemIdentifier(targeted.identifier)])
+        RemoteChangeTargets.shared.requestFullScan()
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+
+        XCTAssertNil(observer.error)
+        XCTAssertTrue(
+            recorder.paths.contains { $0.hasSuffix("/untouched") },
+            "A requested full scan must read containers no push named. Got: \(recorder.paths)"
+        )
+        XCTAssertFalse(RemoteChangeTargets.shared.shouldRunFullScan(), "The completed walk settles the request.")
+    }
+
+    /// The main app sends a notification without file ids whenever the push connection is
+    /// (re-)established, and the extension must answer it with a full walk.
+    func testAFileChangeNotificationWithoutIdsRequestsAFullScan() {
+        let ext = FileProviderExtension(
+            domain: NSFileProviderDomain(identifier: .init(UUID().uuidString), displayName: "Reconnect test")
+        )
+        defer { ext.invalidate() }
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+        XCTAssertFalse(RemoteChangeTargets.shared.shouldRunFullScan())
+
+        let handled = expectation(description: "The notification is handled.")
+        ext.processFileIdsChanged([]) { _ in handled.fulfill() }
+        wait(for: [handled], timeout: 5)
+
+        XCTAssertTrue(RemoteChangeTargets.shared.shouldRunFullScan(), "A notification without file ids must request a full scan.")
+    }
+
+    /// Without the request the same setup stays targeted, which is what makes the test above meaningful.
+    func testWithoutARequestPendingTargetsKeepTheScanNarrow() async throws {
+        let targeted = makeFolder(name: "targeted", parent: rootItem, etag: "targeted-v1")
+        let untouched = makeFolder(name: "untouched", parent: rootItem, etag: "untouched-v1")
+        seed(targeted, visitedDirectory: true)
+        seed(untouched, visitedDirectory: true)
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let recorder = EnumeratePathRecorder()
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            recorder.add(remotePath)
+        }
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+        RemoteChangeTargets.shared.record(containers: [NSFileProviderItemIdentifier(targeted.identifier)])
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+
+        XCTAssertNil(observer.error)
+        XCTAssertTrue(recorder.paths.contains { $0.hasSuffix("/targeted") })
+        XCTAssertFalse(
+            recorder.paths.contains { $0.hasSuffix("/untouched") },
+            "Without a request only the targeted container is read. Got: \(recorder.paths)"
         )
     }
 

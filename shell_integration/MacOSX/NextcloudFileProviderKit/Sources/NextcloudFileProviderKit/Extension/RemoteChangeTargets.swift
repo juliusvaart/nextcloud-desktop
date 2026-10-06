@@ -21,10 +21,11 @@ import Foundation
 ///
 /// ## Why the full scan stays
 ///
-/// Push is not a guarantee. Messages are lost across reconnects and the socket can be down entirely,
-/// and the server only propagates etags up the tree — a push tells us a subtree changed, not that
-/// nothing else did. Targeted scans are therefore an accelerator layered over the periodic full
-/// walk, never a replacement: ``shouldRunFullScan(now:)`` forces one whenever nothing is targeted or
+/// Push is not a guarantee. Messages are lost while the socket is down, and the server only
+/// propagates etags up the tree — a push tells us a subtree changed, not that nothing else did.
+/// Targeted scans are therefore an accelerator layered over the full walk, never a replacement:
+/// ``shouldRunFullScan(now:)`` forces one when nothing is targeted, when one was requested with
+/// ``requestFullScan(at:)`` because the push connection was just re-established, and once
 /// ``fullScanInterval`` has elapsed, so anything push missed is still reconciled.
 ///
 /// Guarded by an `NSLock` and process-wide, matching ``PendingMaterializationRegistry``. One
@@ -33,12 +34,18 @@ import Foundation
 final class RemoteChangeTargets: @unchecked Sendable {
     static let shared = RemoteChangeTargets()
 
+    ///
     /// How long a targeted-only run may go before a full reconciliation is forced anyway.
-    static let fullScanInterval: TimeInterval = 10 * 60
+    ///
+    /// A backstop, not the main defence: the window in which pushes are lost, a dropped connection,
+    /// already ends with a requested full walk.
+    ///
+    static let fullScanInterval: TimeInterval = 60 * 60
 
     private let lock = NSLock()
     private var pending = Set<NSFileProviderItemIdentifier>()
     private var lastFullScan: Date?
+    private var fullScanRequestedAt: Date?
 
     ///
     /// Note that a push named these containers as changed.
@@ -88,23 +95,43 @@ final class RemoteChangeTargets: @unchecked Sendable {
     ///
     /// Whether this derivation must be a full walk rather than a targeted one.
     ///
-    /// True until the first full scan has run, and again once ``fullScanInterval`` has elapsed since
-    /// it — so a long stream of pushes can never postpone reconciliation indefinitely.
+    /// True until the first full scan has run, while a requested one is outstanding, and again once
+    /// ``fullScanInterval`` has elapsed since the last — so a long stream of pushes can never
+    /// postpone reconciliation indefinitely.
     ///
     func shouldRunFullScan(now: Date = Date()) -> Bool {
         lock.lock()
         defer { lock.unlock() }
 
-        guard let lastFullScan else { return true }
+        guard fullScanRequestedAt == nil, let lastFullScan else { return true }
 
         return now.timeIntervalSince(lastFullScan) >= Self.fullScanInterval
     }
 
-    /// Record that a full walk just completed, restarting the interval.
-    func noteFullScanCompleted(at date: Date = Date()) {
+    ///
+    /// Demand a full walk even when pushes have targeted containers, for a signal that carries no
+    /// file ids, which the main app sends whenever the push connection has been (re-)established.
+    ///
+    func requestFullScan(at date: Date = Date()) {
         lock.lock()
         defer { lock.unlock() }
-        lastFullScan = date
+        fullScanRequestedAt = date
+    }
+
+    ///
+    /// Record that a full walk which started at `startedAt` completed, restarting the interval.
+    ///
+    /// A request made after the walk started stays outstanding, because the walk may already have
+    /// read the folders that changed before that request.
+    ///
+    func noteFullScanCompleted(startedAt: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        lastFullScan = startedAt
+
+        if let fullScanRequestedAt, fullScanRequestedAt <= startedAt {
+            self.fullScanRequestedAt = nil
+        }
     }
 
     /// Drop all state. Test seam — the registry is a process-wide singleton.
@@ -113,5 +140,6 @@ final class RemoteChangeTargets: @unchecked Sendable {
         defer { lock.unlock() }
         pending.removeAll()
         lastFullScan = nil
+        fullScanRequestedAt = nil
     }
 }

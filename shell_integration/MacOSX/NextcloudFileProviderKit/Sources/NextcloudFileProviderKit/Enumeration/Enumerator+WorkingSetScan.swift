@@ -45,18 +45,20 @@ extension Enumerator {
 
                 // Prefer the containers a push named. Push identifies a change within a second,
                 // whereas the full walk grows with the materialised set — 305 seconds when this was
-                // measured. The full walk still runs when nothing is targeted, and is forced every
-                // `fullScanInterval` regardless, because push can drop messages across reconnects
-                // and only ever tells us what *did* change. See ``RemoteChangeTargets``.
+                // measured. The full walk still runs when nothing is targeted, after the push
+                // connection is re-established, and every `fullScanInterval` regardless, because
+                // push can drop messages and only ever tells us what *did* change. See
+                // ``RemoteChangeTargets``.
                 let targets = RemoteChangeTargets.shared.consumeTargets()
                 let runFullScan = targets == nil || RemoteChangeTargets.shared.shouldRunFullScan()
+                let scanStartedAt = Date()
 
                 let serverChanges = await scanMaterialisedItemsForRemoteChanges(
                     restrictedToContainers: runFullScan ? nil : targets
                 )
 
                 if runFullScan, !serverChanges.hadFailure {
-                    RemoteChangeTargets.shared.noteFullScanCompleted()
+                    RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: scanStartedAt)
                 }
 
                 // A failed local read is treated like a failed server scan: the incoming anchor is kept so the changes are retried on the next signal.

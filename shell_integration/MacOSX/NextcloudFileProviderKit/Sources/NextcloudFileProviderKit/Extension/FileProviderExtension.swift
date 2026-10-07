@@ -582,6 +582,9 @@ import OSLog
     // MARK: - Helper functions
 
     func signalEnumerator(completionHandler: @Sendable @escaping (_ error: Error?) -> Void) {
+        // Only the failed operations signal through here, and what the server now holds is what settles them.
+        RemoteChangeTargets.shared.requestFullScan()
+
         guard let manager else {
             logger.error("Cannot get file provider manager for domain. Cannot signal enumerator.")
             return
@@ -605,6 +608,8 @@ import OSLog
         }
 
         logger.debug("Signalling enumerators.")
+        // A new or changed account has not been reconciled with the server yet.
+        RemoteChangeTargets.shared.requestFullScan()
         notifyChange()
 
         // Also nudge the root container so its enumerator's `enumerateChanges(for:from:)` is

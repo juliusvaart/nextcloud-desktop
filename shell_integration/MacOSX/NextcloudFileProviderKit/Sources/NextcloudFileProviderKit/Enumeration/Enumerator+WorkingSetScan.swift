@@ -45,17 +45,25 @@ extension Enumerator {
 
                 // Prefer the containers a push named. Push identifies a change within a second,
                 // whereas the full walk grows with the materialised set — 305 seconds when this was
-                // measured. The full walk still runs when nothing is targeted, after the push
-                // connection is re-established, and every `fullScanInterval` regardless, because
-                // push can drop messages and only ever tells us what *did* change. See
-                // ``RemoteChangeTargets``.
+                // measured. The full walk runs on launch, when one was requested (after the push
+                // connection is re-established, or for a failure only the server can settle), and
+                // every `fullScanInterval` regardless, because push can drop messages and only ever
+                // tells us what *did* change. Anything else signalling the working set, the system
+                // included, gets only the local changes. See ``RemoteChangeTargets``.
                 let targets = RemoteChangeTargets.shared.consumeTargets()
-                let runFullScan = targets == nil || RemoteChangeTargets.shared.shouldRunFullScan()
+                let runFullScan = RemoteChangeTargets.shared.shouldRunFullScan()
                 let scanStartedAt = Date()
 
-                let serverChanges = await scanMaterialisedItemsForRemoteChanges(
-                    restrictedToContainers: runFullScan ? nil : targets
-                )
+                let serverChanges: (updated: [SendableItemMetadata], deleted: [SendableItemMetadata], hadFailure: Bool)
+
+                if runFullScan || targets != nil {
+                    serverChanges = await scanMaterialisedItemsForRemoteChanges(
+                        restrictedToContainers: runFullScan ? nil : targets
+                    )
+                } else {
+                    logger.info("Nothing was pushed or requested since the last full scan, so the server is not read.")
+                    serverChanges = ([], [], false)
+                }
 
                 if runFullScan, !serverChanges.hadFailure {
                     RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: scanStartedAt)

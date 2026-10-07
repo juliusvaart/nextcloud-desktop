@@ -62,7 +62,9 @@ extension FileProviderExtension: ClientCommunicationProtocol {
         }
 
         guard let dbManager else {
-            logger.info("Received file ID changes before database setup. Signalling enumerator.")
+            logger.info("Received file ID changes before database setup. Requesting a full scan.")
+            // Without the database the ids cannot be resolved to containers to re-read.
+            RemoteChangeTargets.shared.requestFullScan()
             notifyChange()
             completionHandler(true)
             return

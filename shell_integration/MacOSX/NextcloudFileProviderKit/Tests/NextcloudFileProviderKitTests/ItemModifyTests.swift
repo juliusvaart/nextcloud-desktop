@@ -563,6 +563,40 @@ final class ItemModifyTests: NextcloudFileProviderKitTestCase {
         )
     }
 
+    /// A locked upload is settled by what the server now holds, so it must request a full walk rather
+    /// than rely on one happening anyway.
+    func testALockedUploadRequestsAFullScan() async throws {
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        remoteInterface.uploadError = NKError(statusCode: 423, fallbackDescription: "Locked")
+
+        let itemMetadata = remoteItem.toItemMetadata(account: Self.account)
+        Self.dbManager.addItemMetadata(itemMetadata)
+
+        let newContentsUrl = FileManager.default.temporaryDirectory
+            .appendingPathComponent("modify-locked-\(UUID().uuidString)")
+        try "Updated content".write(to: newContentsUrl, atomically: true, encoding: .utf8)
+
+        let item = Item(
+            metadata: itemMetadata,
+            parentItemIdentifier: .rootContainer,
+            account: Self.account,
+            remoteInterface: remoteInterface,
+            dbManager: Self.dbManager
+        )
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+
+        let (_, error) = await item.modify(
+            itemTarget: item,
+            changedFields: [.contents, .contentModificationDate],
+            contents: newContentsUrl,
+            dbManager: Self.dbManager
+        )
+
+        XCTAssertNotNil(error)
+        XCTAssertTrue(RemoteChangeTargets.shared.shouldRunFullScan())
+    }
+
     /// The server changes the etag while acquiring an exclusive token lock, but
     /// File Provider correctly supplies the version from which the document was
     /// opened. The token must be the only write precondition for that owner upload;

@@ -1104,6 +1104,73 @@ final class RemoteChangePropagationTests: NextcloudFileProviderKitTestCase {
         )
     }
 
+    /// The system signals the working set on its own too; with nothing pushed or requested since the
+    /// last walk that must not cost a walk of the materialised set.
+    func testWithNothingPushedOrRequestedTheServerIsNotRead() async throws {
+        let folder = makeFolder(name: "folder", parent: rootItem, etag: "folder-v1")
+        seed(folder, visitedDirectory: true)
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let recorder = EnumeratePathRecorder()
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            recorder.add(remotePath)
+        }
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+
+        XCTAssertNil(observer.error)
+        XCTAssertTrue(recorder.paths.isEmpty, "Nothing asked for the server, so it must not be read. Got: \(recorder.paths)")
+    }
+
+    /// The first derivation after launch has no walk behind it, so it still reads everything.
+    func testTheFirstDerivationWalksEvenWithNothingRequested() async throws {
+        let folder = makeFolder(name: "folder", parent: rootItem, etag: "folder-v1")
+        seed(folder, visitedDirectory: true)
+
+        let remoteInterface = MockRemoteInterface(account: Self.account, rootItem: rootItem)
+        let recorder = EnumeratePathRecorder()
+        remoteInterface.enumerateCallHandler = { remotePath, _, _, _, _, _, _, _ in
+            recorder.add(remotePath)
+        }
+
+        let observer = try await runWorkingSetChanges(remoteInterface)
+
+        XCTAssertNil(observer.error)
+        XCTAssertTrue(recorder.paths.contains { $0.hasSuffix("/folder") })
+    }
+
+    /// A failed create, modify or delete signals the working set so the server's state settles it,
+    /// which now needs an explicit request.
+    func testAFailedOperationSignalRequestsAFullScan() {
+        let ext = FileProviderExtension(
+            domain: NSFileProviderDomain(identifier: .init(UUID().uuidString), displayName: "Failure test")
+        )
+        defer { ext.invalidate() }
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+        ext.signalEnumerator { _ in }
+
+        XCTAssertTrue(RemoteChangeTargets.shared.shouldRunFullScan())
+    }
+
+    /// Before the database is set up a push cannot be resolved to containers, so it must not be lost.
+    func testFileIdsBeforeDatabaseSetupRequestAFullScan() {
+        let ext = FileProviderExtension(
+            domain: NSFileProviderDomain(identifier: .init(UUID().uuidString), displayName: "Early push test")
+        )
+        defer { ext.invalidate() }
+
+        RemoteChangeTargets.shared.noteFullScanCompleted(startedAt: Date())
+
+        let handled = expectation(description: "The notification is handled.")
+        ext.processFileIdsChanged([42]) { _ in handled.fulfill() }
+        wait(for: [handled], timeout: 5)
+
+        XCTAssertTrue(RemoteChangeTargets.shared.shouldRunFullScan())
+    }
+
     /// Consuming clears, so one push's containers are not re-scanned on every later derivation.
     func testConsumingTargetsClearsThem() {
         let targets = RemoteChangeTargets.shared

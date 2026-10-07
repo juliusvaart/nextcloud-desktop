@@ -148,6 +148,20 @@ public extension Item {
         return (modifiedItem, nil)
     }
 
+    ///
+    /// Ask for a full walk and signal the working set, for an upload failure that only the server's
+    /// current state can settle, such as a newer version or a renamed parent folder.
+    ///
+    private func requestServerReconciliation(domain: NSFileProviderDomain?) {
+        RemoteChangeTargets.shared.requestFullScan()
+
+        if let domain, let manager = NSFileProviderManager(for: domain) {
+            Task {
+                try? await manager.signalEnumerator(for: .workingSet)
+            }
+        }
+    }
+
     private func modifyContents(
         contents newContents: URL?,
         remotePath: String,
@@ -284,11 +298,7 @@ public extension Item {
                 metadata.status = Status.uploadError.rawValue
                 metadata.sessionError = error.errorDescription
                 dbManager.addItemMetadata(metadata)
-                if let domain, let manager = NSFileProviderManager(for: domain) {
-                    Task {
-                        try? await manager.signalEnumerator(for: .workingSet)
-                    }
-                }
+                requestServerReconciliation(domain: domain)
 
                 // macOS 26+: hand the system the dedicated conflict error so it
                 // creates a conflict copy and both versions survive.
@@ -312,11 +322,7 @@ public extension Item {
                 // Signal re-enumeration: if the parent was also renamed (causing the
                 // precondition failure), the working set check will update the path
                 // before the system retries.
-                if let domain, let manager = NSFileProviderManager(for: domain) {
-                    Task {
-                        try? await manager.signalEnumerator(for: .workingSet)
-                    }
-                }
+                requestServerReconciliation(domain: domain)
             }
 
             // Remote path gone — parent renamed on another client while the file was
@@ -329,11 +335,7 @@ public extension Item {
                 metadata.status = Status.uploadError.rawValue
                 metadata.sessionError = error.errorDescription
                 dbManager.addItemMetadata(metadata)
-                if let domain, let manager = NSFileProviderManager(for: domain) {
-                    Task {
-                        try? await manager.signalEnumerator(for: .workingSet)
-                    }
-                }
+                requestServerReconciliation(domain: domain)
                 return (nil, NSFileProviderError(.cannotSynchronize))
             }
 

@@ -24,9 +24,10 @@ import Foundation
 /// Push is not a guarantee. Messages are lost while the socket is down, and the server only
 /// propagates etags up the tree — a push tells us a subtree changed, not that nothing else did.
 /// Targeted scans are therefore an accelerator layered over the full walk, never a replacement:
-/// ``shouldRunFullScan(now:)`` forces one when nothing is targeted, when one was requested with
-/// ``requestFullScan(at:)`` because the push connection was just re-established, and once
-/// ``fullScanInterval`` has elapsed, so anything push missed is still reconciled.
+/// ``shouldRunFullScan(now:)`` forces one before the first walk, when one was requested with
+/// ``requestFullScan(at:)`` because the push connection was just re-established or a failure needs
+/// the server's current state, and once ``fullScanInterval`` has elapsed, so anything push missed is
+/// still reconciled. A derivation with nothing targeted and no walk due does not read the server.
 ///
 /// Guarded by an `NSLock` and process-wide, matching ``PendingMaterializationRegistry``. One
 /// extension process serves one domain.
@@ -62,8 +63,7 @@ final class RemoteChangeTargets: @unchecked Sendable {
     ///
     /// Take the containers accumulated since the last derivation, clearing them.
     ///
-    /// Returns `nil` when nothing is pending, which the caller reads as "no targeting information —
-    /// fall back to the full walk".
+    /// Returns `nil` when nothing is pending, which the caller reads as "no container to re-read".
     ///
     func consumeTargets() -> Set<NSFileProviderItemIdentifier>? {
         lock.lock()
@@ -109,8 +109,9 @@ final class RemoteChangeTargets: @unchecked Sendable {
     }
 
     ///
-    /// Demand a full walk even when pushes have targeted containers, for a signal that carries no
-    /// file ids, which the main app sends whenever the push connection has been (re-)established.
+    /// Demand a full walk even when pushes have targeted containers, for a signal that names no
+    /// container: the main app's notification without file ids, sent whenever the push connection
+    /// has been (re-)established, or a failure only the server's current state can settle.
     ///
     func requestFullScan(at date: Date = Date()) {
         lock.lock()
